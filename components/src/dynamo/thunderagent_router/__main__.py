@@ -44,6 +44,10 @@ logger = logging.getLogger(__name__)
 
 
 def _extract_program_id(request: dict[str, Any]) -> Optional[str]:
+    import logging as _lg
+    _lg.getLogger("dynamo.thunderagent_router").info(
+        "EXTRACT_PID keys=%s agent_context=%s",
+        list(request.keys())[:12], request.get("agent_context"))
     ctx = request.get("agent_context")
     if not isinstance(ctx, dict):
         return None
@@ -112,7 +116,10 @@ class ThunderAgentRouterHandler:
             aic_perf_config=build_aic_perf_config(self._config),
         )
 
-        self._capacity = WorkerCapacityProvider(worker_endpoint)
+        self._capacity = WorkerCapacityProvider(
+            worker_endpoint,
+            hicache_ratio=getattr(self._config, "hicache_ratio", 0.0),
+        )
         self._capacity.start()
 
         self._scheduler = ThunderAgentScheduler(

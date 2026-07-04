@@ -32,6 +32,7 @@ class ThunderAgentRouterConfig(DynamoRouterConfig):
     acting_token_weight: float
     acting_decay_tau_seconds: float
     scheduler_interval_seconds: float
+    hicache_ratio: float = 0.0
     model_name: Optional[str] = None
     model_path: Optional[str] = None
     tool_call_parser: Optional[str] = None
@@ -88,6 +89,18 @@ class ThunderAgentArgGroup(ArgGroup):
             default=0.95,
             help="Hard-pause when worker utilization >= this fraction of "
             "max_num_batched_tokens (default: 0.95)",
+            arg_type=float,
+        )
+        add_argument(
+            g,
+            flag_name="--hicache-ratio",
+            env_var="DYN_THUNDERAGENT_HICACHE_RATIO",
+            default=0.0,
+            help="HiCache host-pool / device-pool ratio (mirrors SGLang "
+            "--hicache-ratio). When > 0, worker KV capacity is scaled by "
+            "(1 + hicache_ratio) so the scheduler accounts for the L2 host "
+            "pool and does not pause programs HiCache can keep resident via "
+            "offload. 0.0 (default) keeps GPU-only capacity (unchanged behavior).",
             arg_type=float,
         )
         add_argument(
