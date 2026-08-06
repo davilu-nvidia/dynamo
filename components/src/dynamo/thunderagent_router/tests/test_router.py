@@ -369,3 +369,137 @@ async def test_scheduler_tick_resumes_before_pausing_new_overload():
         if p.lifecycle == ProgramLifecycle.PAUSED
     )
     assert paused == 6
+
+
+# ---------------------------------------------------------------------------
+# Gap-harvest warmup
+# ---------------------------------------------------------------------------
+
+
+def warmup_config(**overrides) -> ThunderAgentConfig:
+    defaults = dict(
+        scheduler_interval_seconds=0.05,
+        resume_timeout_seconds=2.0,
+        warmup_enabled=True,
+        warmup_util_threshold=0.50,
+        warmup_lead_seconds=5.0,
+        warmup_min_samples=2,
+        warmup_max_per_tick=4,
+    )
+    defaults.update(overrides)
+    return ThunderAgentConfig(**defaults)
+
+
+async def run_one_step(router: ThunderAgentScheduler, program_id: str) -> None:
+    await router.before_request(program_id)
+    await router.after_request(program_id, prompt_tokens=100, completion_tokens=50)
+
+
+@pytest.mark.asyncio
+async def test_gap_samples_recorded_on_return():
+    router, _ = make_router(capacity_workers={1: 10_000})
+    await run_one_step(router, "p1")
+    program = router._table.programs["p1"]
+    # Backdate the acting gap, then return for the next step.
+    program.acting_since = time.monotonic() - 3.0
+    await run_one_step(router, "p1")
+    assert len(program.gap_samples) == 1
+    assert program.gap_samples[0] == pytest.approx(3.0, abs=0.5)
+
+
+@pytest.mark.asyncio
+async def test_warmup_fires_once_per_gap():
+    fired: list[tuple[str, int]] = []
+
+    async def warmup_fn(program_id: str, worker_id: int) -> bool:
+        fired.append((program_id, worker_id))
+        return True
+
+    router, capacity = make_router(
+        capacity_workers={1: 10_000}, config=warmup_config()
+    )
+    router.set_warmup_callback(warmup_fn)
+    await run_one_step(router, "p1")
+
+    program = router._table.programs["p1"]
+    program.gap_samples = [8.0, 8.0]
+    program.acting_since = time.monotonic() - 4.0  # elapsed >= 8 - 5
+
+    await router._maybe_warmup(capacity.snapshot())
+    await asyncio.sleep(0.05)
+    assert fired == [("p1", 1)]
+    assert program.warmup_step == program.step_count
+
+    # Same gap: no second warmup.
+    await router._maybe_warmup(capacity.snapshot())
+    await asyncio.sleep(0.05)
+    assert len(fired) == 1
+
+
+@pytest.mark.asyncio
+async def test_warmup_waits_for_predicted_return():
+    fired: list[str] = []
+
+    async def warmup_fn(program_id: str, worker_id: int) -> bool:
+        fired.append(program_id)
+        return True
+
+    router, capacity = make_router(
+        capacity_workers={1: 10_000}, config=warmup_config()
+    )
+    router.set_warmup_callback(warmup_fn)
+    await run_one_step(router, "p1")
+
+    program = router._table.programs["p1"]
+    program.gap_samples = [60.0, 60.0]
+    program.acting_since = time.monotonic() - 1.0  # elapsed < 60 - 5
+
+    await router._maybe_warmup(capacity.snapshot())
+    await asyncio.sleep(0.05)
+    assert fired == []
+
+
+@pytest.mark.asyncio
+async def test_warmup_gated_by_utilization():
+    fired: list[str] = []
+
+    async def warmup_fn(program_id: str, worker_id: int) -> bool:
+        fired.append(program_id)
+        return True
+
+    # token_total 150 + buffer 100 = 250 used; capacity 400 -> util 0.625.
+    router, capacity = make_router(
+        capacity_workers={1: 400}, config=warmup_config()
+    )
+    router.set_warmup_callback(warmup_fn)
+    await run_one_step(router, "p1")
+
+    program = router._table.programs["p1"]
+    program.gap_samples = [1.0, 1.0]
+    program.acting_since = time.monotonic() - 10.0
+
+    await router._maybe_warmup(capacity.snapshot())
+    await asyncio.sleep(0.05)
+    assert fired == []
+    assert router._stat_warmups_skipped_util == 1
+
+
+@pytest.mark.asyncio
+async def test_warmup_disabled_by_default():
+    fired: list[str] = []
+
+    async def warmup_fn(program_id: str, worker_id: int) -> bool:
+        fired.append(program_id)
+        return True
+
+    router, capacity = make_router(capacity_workers={1: 10_000})
+    router.set_warmup_callback(warmup_fn)
+    await run_one_step(router, "p1")
+
+    program = router._table.programs["p1"]
+    program.gap_samples = [1.0, 1.0]
+    program.acting_since = time.monotonic() - 10.0
+
+    await router._maybe_warmup(capacity.snapshot())
+    await asyncio.sleep(0.05)
+    assert fired == []

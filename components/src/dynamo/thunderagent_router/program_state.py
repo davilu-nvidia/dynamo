@@ -16,6 +16,10 @@ from enum import Enum
 from typing import Optional
 
 
+# Sliding-window size for per-program acting-gap samples.
+GAP_SAMPLE_WINDOW = 8
+
+
 class ProgramStatus(Enum):
     REASONING = "reasoning"
     ACTING = "acting"
@@ -47,6 +51,13 @@ class Program:
     # monotonic seconds; used to compute resume-side decay
     acting_since: float = 0.0
 
+    # Recent acting-gap durations in seconds, newest last. Bounded window
+    # (GAP_SAMPLE_WINDOW) feeding the gap-harvest warmup predictor.
+    gap_samples: list[float] = field(default_factory=list, repr=False)
+    # ``step_count`` value when the last warmup fired, so at most one warmup
+    # is issued per acting gap.
+    warmup_step: int = -1
+
 
 @dataclass
 class ProgramTable:
@@ -65,6 +76,12 @@ class ProgramTable:
         program.step_count += 1
         if estimated_prompt_tokens > 0:
             program.token_total = estimated_prompt_tokens
+        if program.status == ProgramStatus.ACTING and program.acting_since > 0:
+            # The program came back from a tool call: record the observed
+            # acting-gap duration for the warmup predictor.
+            program.gap_samples.append(time.monotonic() - program.acting_since)
+            if len(program.gap_samples) > GAP_SAMPLE_WINDOW:
+                del program.gap_samples[0]
         program.status = ProgramStatus.REASONING
         program.acting_since = 0.0
         return program

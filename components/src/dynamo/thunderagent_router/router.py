@@ -12,9 +12,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import statistics
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from dynamo.thunderagent_router.capacity import WorkerCapacityProvider
 from dynamo.thunderagent_router.program_state import (
@@ -50,6 +51,16 @@ class ThunderAgentConfig:
     acting_token_weight: float = 1.0
     acting_decay_tau_seconds: float = 1.0
     buffer_per_program: int = 100
+    # Gap-harvest warmup: during a program's acting gap (tool execution), if
+    # the pinned worker has spare capacity and the program is predicted to
+    # return soon, re-warm its prefix with a max_tokens=1 prefill so the next
+    # turn hits cache instead of recomputing an evicted prefix. Off by
+    # default; utilization-gated so it never competes with pause/resume.
+    warmup_enabled: bool = False
+    warmup_util_threshold: float = 0.50
+    warmup_lead_seconds: float = 5.0
+    warmup_min_samples: int = 2
+    warmup_max_per_tick: int = 4
 
 
 class ThunderAgentScheduler:
@@ -72,6 +83,21 @@ class ThunderAgentScheduler:
         self._stat_resumes = 0
         self._stat_marked_for_pause = 0
         self._stat_worker_assignments = 0
+        self._stat_warmups_fired = 0
+        self._stat_warmups_failed = 0
+        self._stat_warmups_skipped_util = 0
+        self._warmup_fn: Optional[Callable[[str, int], Awaitable[bool]]] = None
+
+    def set_warmup_callback(
+        self, warmup_fn: Callable[[str, int], Awaitable[bool]]
+    ) -> None:
+        """Register the coroutine that executes a warmup prefill.
+
+        Called as ``warmup_fn(program_id, worker_id)``; returns True on
+        success. The scheduler only decides *when* to warm; the handler owns
+        the cached prefix and the engine client.
+        """
+        self._warmup_fn = warmup_fn
 
     def start(self) -> None:
         if self._scheduler_task is not None:
@@ -270,6 +296,78 @@ class ThunderAgentScheduler:
         self._apply_soft_demotes(capacities)
         await self._greedy_resume(capacities)
         await self._pause_until_safe(capacities)
+        await self._maybe_warmup(capacities)
+
+    async def _maybe_warmup(self, capacities: dict[int, int]) -> None:
+        """Fire prefix warmups for acting programs predicted to return soon.
+
+        A program qualifies when all of the following hold:
+        - it is ACTIVE + ACTING with a pinned worker present in ``capacities``,
+        - it has at least ``warmup_min_samples`` observed acting gaps,
+        - elapsed gap time >= median(gap samples) - ``warmup_lead_seconds``,
+        - pinned worker utilization < ``warmup_util_threshold``, and
+        - no warmup was fired for the current step yet.
+
+        The utilization gate makes this strictly slack-harvesting: under
+        pressure the gate closes and pause/resume remains the only mechanism.
+        """
+        if not self._cfg.warmup_enabled or self._warmup_fn is None:
+            return
+        now = time.monotonic()
+        picked: list[tuple[str, int, float, float]] = []
+        async with self._lock:
+            for program in self._table.programs.values():
+                if len(picked) >= self._cfg.warmup_max_per_tick:
+                    break
+                worker_id = program.assigned_worker_id
+                if (
+                    program.lifecycle != ProgramLifecycle.ACTIVE
+                    or program.status != ProgramStatus.ACTING
+                    or worker_id is None
+                    or worker_id not in capacities
+                    or program.acting_since <= 0
+                    or program.warmup_step == program.step_count
+                    or len(program.gap_samples) < self._cfg.warmup_min_samples
+                ):
+                    continue
+                predicted = statistics.median(program.gap_samples)
+                elapsed = now - program.acting_since
+                if elapsed < max(0.0, predicted - self._cfg.warmup_lead_seconds):
+                    continue
+                capacity = capacities[worker_id]
+                util = self._worker_used(worker_id) / capacity if capacity else 1.0
+                if util >= self._cfg.warmup_util_threshold:
+                    self._stat_warmups_skipped_util += 1
+                    continue
+                program.warmup_step = program.step_count
+                picked.append((program.program_id, worker_id, elapsed, predicted))
+
+        for program_id, worker_id, elapsed, predicted in picked:
+            self._stat_warmups_fired += 1
+            logger.info(
+                "thunderagent.warmup fire program=%s worker=%s "
+                "elapsed=%.1fs predicted_gap=%.1fs",
+                program_id,
+                worker_id,
+                elapsed,
+                predicted,
+            )
+            asyncio.create_task(self._run_warmup(program_id, worker_id))
+
+    async def _run_warmup(self, program_id: str, worker_id: int) -> None:
+        assert self._warmup_fn is not None
+        try:
+            ok = await self._warmup_fn(program_id, worker_id)
+        except Exception:
+            ok = False
+            logger.warning(
+                "thunderagent.warmup error program=%s worker=%s",
+                program_id,
+                worker_id,
+                exc_info=True,
+            )
+        if not ok:
+            self._stat_warmups_failed += 1
 
     def _program_tokens(self, program: Program, *, decayed: bool = False) -> int:
         if program.status != ProgramStatus.ACTING:
@@ -658,6 +756,9 @@ class ThunderAgentScheduler:
                     "programs_marked_for_pause_total": self._stat_marked_for_pause,
                     "forced_resumes_total": self._stat_forced_resumes,
                     "worker_assignments_total": self._stat_worker_assignments,
+                    "warmups_fired_total": self._stat_warmups_fired,
+                    "warmups_failed_total": self._stat_warmups_failed,
+                    "warmups_skipped_util_total": self._stat_warmups_skipped_util,
                 },
                 "gauges": {
                     "programs_total": len(self._table.programs),

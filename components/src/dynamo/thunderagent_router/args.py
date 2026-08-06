@@ -32,6 +32,11 @@ class ThunderAgentRouterConfig(DynamoRouterConfig):
     acting_token_weight: float
     acting_decay_tau_seconds: float
     scheduler_interval_seconds: float
+    warmup_enabled: bool = False
+    warmup_util_threshold: float = 0.50
+    warmup_lead_seconds: float = 5.0
+    warmup_min_samples: int = 2
+    warmup_max_per_tick: int = 4
     model_name: Optional[str] = None
     model_path: Optional[str] = None
     tool_call_parser: Optional[str] = None
@@ -49,6 +54,11 @@ class ThunderAgentRouterConfig(DynamoRouterConfig):
             acting_token_weight=self.acting_token_weight,
             acting_decay_tau_seconds=self.acting_decay_tau_seconds,
             scheduler_interval_seconds=self.scheduler_interval_seconds,
+            warmup_enabled=self.warmup_enabled,
+            warmup_util_threshold=self.warmup_util_threshold,
+            warmup_lead_seconds=self.warmup_lead_seconds,
+            warmup_min_samples=self.warmup_min_samples,
+            warmup_max_per_tick=self.warmup_max_per_tick,
         )
 
     def validate(self) -> None:  # type: ignore[override]
@@ -69,6 +79,14 @@ class ThunderAgentRouterConfig(DynamoRouterConfig):
             raise ValueError("--scheduler-interval-seconds must be > 0")
         if self.resume_timeout_seconds <= 0:
             raise ValueError("--resume-timeout-seconds must be > 0")
+        if not 0.0 <= self.warmup_util_threshold <= 1.0:
+            raise ValueError("--warmup-util-threshold must be in [0, 1]")
+        if self.warmup_lead_seconds < 0:
+            raise ValueError("--warmup-lead-seconds must be >= 0")
+        if self.warmup_min_samples < 1:
+            raise ValueError("--warmup-min-samples must be >= 1")
+        if self.warmup_max_per_tick < 1:
+            raise ValueError("--warmup-max-per-tick must be >= 1")
 
 
 class ThunderAgentArgGroup(ArgGroup):
@@ -89,6 +107,54 @@ class ThunderAgentArgGroup(ArgGroup):
             help="Hard-pause when worker utilization >= this fraction of "
             "max_num_batched_tokens (default: 0.95)",
             arg_type=float,
+        )
+        add_argument(
+            g,
+            flag_name="--warmup-enabled",
+            env_var="DYN_THUNDERAGENT_WARMUP_ENABLED",
+            default=False,
+            help="Enable gap-harvest warmup: during a program's acting gap, "
+            "re-warm its prefix on the pinned worker with a max_tokens=1 "
+            "prefill when the worker is below --warmup-util-threshold and "
+            "the program is predicted to return within --warmup-lead-seconds "
+            "(default: off)",
+            arg_type=lambda v: str(v).lower() in ("1", "true", "yes", "on"),
+        )
+        add_argument(
+            g,
+            flag_name="--warmup-util-threshold",
+            env_var="DYN_THUNDERAGENT_WARMUP_UTIL_THRESHOLD",
+            default=0.50,
+            help="Only fire warmups when the pinned worker's token "
+            "utilization is below this fraction (default: 0.50)",
+            arg_type=float,
+        )
+        add_argument(
+            g,
+            flag_name="--warmup-lead-seconds",
+            env_var="DYN_THUNDERAGENT_WARMUP_LEAD_SECONDS",
+            default=5.0,
+            help="Fire the warmup this many seconds before the predicted "
+            "return (median of observed acting gaps) (default: 5.0)",
+            arg_type=float,
+        )
+        add_argument(
+            g,
+            flag_name="--warmup-min-samples",
+            env_var="DYN_THUNDERAGENT_WARMUP_MIN_SAMPLES",
+            default=2,
+            help="Observed acting gaps required before predicting a "
+            "program's return time (default: 2)",
+            arg_type=int,
+        )
+        add_argument(
+            g,
+            flag_name="--warmup-max-per-tick",
+            env_var="DYN_THUNDERAGENT_WARMUP_MAX_PER_TICK",
+            default=4,
+            help="Warmup prefills fired per scheduler tick at most "
+            "(default: 4)",
+            arg_type=int,
         )
         add_argument(
             g,
