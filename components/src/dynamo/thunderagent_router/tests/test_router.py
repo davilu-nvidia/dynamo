@@ -503,3 +503,69 @@ async def test_warmup_disabled_by_default():
     await router._maybe_warmup(capacity.snapshot())
     await asyncio.sleep(0.05)
     assert fired == []
+
+
+# ---------------------------------------------------------------------------
+# Prefill admission pacing
+# ---------------------------------------------------------------------------
+
+from dynamo.thunderagent_router.router import PrefillPacer  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_pacer_limits_inflight_and_releases_sjf():
+    pacer = PrefillPacer(limit=1, max_wait_seconds=5.0)
+    await pacer.acquire(1, cost=100)  # takes the slot
+
+    order: list[str] = []
+
+    async def contender(name: str, cost: float):
+        await pacer.acquire(1, cost)
+        order.append(name)
+
+    big = asyncio.create_task(contender("big", 5000))
+    await asyncio.sleep(0.01)
+    small = asyncio.create_task(contender("small", 10))
+    await asyncio.sleep(0.01)
+    assert order == []  # both queued behind the held slot
+
+    pacer.release(1)  # slot transfers to cheapest waiter first
+    await asyncio.sleep(0.01)
+    assert order == ["small"]
+    pacer.release(1)
+    await asyncio.sleep(0.01)
+    assert order == ["small", "big"]
+    await asyncio.gather(big, small)
+    assert pacer.stat_paced_total == 2
+    assert pacer.stat_timeouts_total == 0
+
+
+@pytest.mark.asyncio
+async def test_pacer_timeout_lets_request_proceed():
+    pacer = PrefillPacer(limit=1, max_wait_seconds=0.05)
+    await pacer.acquire(1, cost=1)
+    await pacer.acquire(1, cost=1)  # times out, proceeds anyway
+    assert pacer.stat_timeouts_total == 1
+    # Both slots eventually released without underflow.
+    pacer.release(1)
+    pacer.release(1)
+    pacer.release(1)  # extra release is a no-op
+    await pacer.acquire(1, cost=1)  # slot available again immediately
+
+
+@pytest.mark.asyncio
+async def test_pacer_workers_are_independent():
+    pacer = PrefillPacer(limit=1, max_wait_seconds=5.0)
+    await pacer.acquire(1, cost=1)
+    await pacer.acquire(2, cost=1)  # different worker: no queueing
+    assert pacer.stat_paced_total == 0
+
+
+@pytest.mark.asyncio
+async def test_pacing_cost_uses_last_completion_then_prompt():
+    router, _ = make_router(capacity_workers={1: 10_000})
+    d1 = await router.before_request("p1", estimated_prompt_tokens=1200)
+    assert d1.pacing_cost == 1200  # first step: whole prompt is cold
+    await router.after_request("p1", prompt_tokens=1200, completion_tokens=333)
+    d2 = await router.before_request("p1", estimated_prompt_tokens=1600)
+    assert d2.pacing_cost == 333  # later steps: last completion (divergence)

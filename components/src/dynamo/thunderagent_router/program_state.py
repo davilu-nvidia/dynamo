@@ -57,6 +57,10 @@ class Program:
     # ``step_count`` value when the last warmup fired, so at most one warmup
     # is issued per acting gap.
     warmup_step: int = -1
+    # completion_tokens of the last finished step; proxy for the next step's
+    # expected new prefill tokens (template-stripped divergence), used as the
+    # shortest-job-first cost by the prefill pacer.
+    last_completion_tokens: int = 0
 
 
 @dataclass
@@ -93,6 +97,7 @@ class ProgramTable:
         if program is None:
             return None
         program.token_total = prompt_tokens + completion_tokens
+        program.last_completion_tokens = completion_tokens
         program.status = ProgramStatus.ACTING
         program.acting_since = time.monotonic()
         return program

@@ -37,6 +37,9 @@ class ThunderAgentRouterConfig(DynamoRouterConfig):
     warmup_lead_seconds: float = 5.0
     warmup_min_samples: int = 2
     warmup_max_per_tick: int = 4
+    pacing_enabled: bool = False
+    pacing_inflight_limit: int = 2
+    pacing_max_wait_seconds: float = 2.0
     model_name: Optional[str] = None
     model_path: Optional[str] = None
     tool_call_parser: Optional[str] = None
@@ -59,6 +62,9 @@ class ThunderAgentRouterConfig(DynamoRouterConfig):
             warmup_lead_seconds=self.warmup_lead_seconds,
             warmup_min_samples=self.warmup_min_samples,
             warmup_max_per_tick=self.warmup_max_per_tick,
+            pacing_enabled=self.pacing_enabled,
+            pacing_inflight_limit=self.pacing_inflight_limit,
+            pacing_max_wait_seconds=self.pacing_max_wait_seconds,
         )
 
     def validate(self) -> None:  # type: ignore[override]
@@ -87,6 +93,10 @@ class ThunderAgentRouterConfig(DynamoRouterConfig):
             raise ValueError("--warmup-min-samples must be >= 1")
         if self.warmup_max_per_tick < 1:
             raise ValueError("--warmup-max-per-tick must be >= 1")
+        if self.pacing_inflight_limit < 1:
+            raise ValueError("--pacing-inflight-limit must be >= 1")
+        if self.pacing_max_wait_seconds < 0:
+            raise ValueError("--pacing-max-wait-seconds must be >= 0")
 
 
 class ThunderAgentArgGroup(ArgGroup):
@@ -155,6 +165,34 @@ class ThunderAgentArgGroup(ArgGroup):
             help="Warmup prefills fired per scheduler tick at most "
             "(default: 4)",
             arg_type=int,
+        )
+        add_argument(
+            g,
+            flag_name="--pacing-enabled",
+            env_var="DYN_THUNDERAGENT_PACING_ENABLED",
+            default=False,
+            help="Enable prefill admission pacing: bound in-flight program "
+            "prefills per worker at --pacing-inflight-limit, queueing excess "
+            "admissions shortest-expected-prefill-first (default: off)",
+            arg_type=lambda v: str(v).lower() in ("1", "true", "yes", "on"),
+        )
+        add_argument(
+            g,
+            flag_name="--pacing-inflight-limit",
+            env_var="DYN_THUNDERAGENT_PACING_INFLIGHT_LIMIT",
+            default=2,
+            help="Program prefills allowed in flight per worker before "
+            "pacing queues new admissions (default: 2)",
+            arg_type=int,
+        )
+        add_argument(
+            g,
+            flag_name="--pacing-max-wait-seconds",
+            env_var="DYN_THUNDERAGENT_PACING_MAX_WAIT_SECONDS",
+            default=2.0,
+            help="Upper bound on pacing delay; on timeout the request "
+            "proceeds anyway (default: 2.0)",
+            arg_type=float,
         )
         add_argument(
             g,

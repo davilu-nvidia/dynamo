@@ -273,6 +273,12 @@ class ThunderAgentRouterHandler:
             routing["backend_instance_id"] = worker_pin
             preprocessed["routing"] = routing
 
+        pacer = self._scheduler.pacer
+        pacer_slot: Optional[int] = None
+        if pacer is not None and worker_pin is not None:
+            await pacer.acquire(worker_pin, decision.pacing_cost)
+            pacer_slot = worker_pin
+
         prompt_tokens_seen = 0
         completion_tokens_seen = 0
         usage_completion_seen = False
@@ -297,6 +303,10 @@ class ThunderAgentRouterHandler:
             async for chunk in await self._kv_router.generate_from_request(
                 preprocessed  # type: ignore[arg-type]
             ):
+                if pacer_slot is not None:
+                    # First token is out: prefill finished, hand the slot on.
+                    pacer.release(pacer_slot)
+                    pacer_slot = None
                 if first_chunk and worker_pin is None:
                     first_chunk = False
                     selected_worker = self._extract_worker_id(chunk)
@@ -342,6 +352,8 @@ class ThunderAgentRouterHandler:
                     _inject_thunderagent_route_proof(chunk, proof)
                 yield chunk
         finally:
+            if pacer_slot is not None:
+                pacer.release(pacer_slot)
             # Fall back to len(token_ids) if the engine didn't report usage --
             # still better than upstream's chars/5 estimator.
             if prompt_tokens_seen == 0 and isinstance(token_ids, list):

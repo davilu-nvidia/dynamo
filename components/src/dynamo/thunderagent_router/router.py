@@ -36,6 +36,9 @@ class PauseDecision:
     was_paused: bool = False
     was_soft_demoted: bool = False
     assigned_worker_hint: Optional[int] = None
+    # Expected new prefill tokens for this step (pacer SJF cost): last step's
+    # completion tokens if known, else the full prompt (first step = cold).
+    pacing_cost: float = 0.0
 
 
 @dataclass
@@ -61,6 +64,75 @@ class ThunderAgentConfig:
     warmup_lead_seconds: float = 5.0
     warmup_min_samples: int = 2
     warmup_max_per_tick: int = 4
+    # Prefill admission pacing: bound the number of program prefills in
+    # flight per worker; excess admissions queue in the router ordered by
+    # expected new prefill tokens (shortest-job-first). Agent arrivals are
+    # naturally bursty (batch starts, similar-duration tool calls returning
+    # together); pacing converts a burst's batched prefill contention into a
+    # pipeline, cutting mean and tail TTFT. Off by default.
+    pacing_enabled: bool = False
+    pacing_inflight_limit: int = 2
+    pacing_max_wait_seconds: float = 2.0
+
+
+class PrefillPacer:
+    """Per-worker in-flight prefill limiter with shortest-job-first release.
+
+    ``acquire`` blocks while ``limit`` requests hold slots for the same
+    worker, releasing waiters in ascending expected-cost order. A bounded
+    wait keeps the pacer strictly best-effort: on timeout the request
+    proceeds anyway, so a stuck stream can never wedge admissions.
+    """
+
+    def __init__(self, limit: int, max_wait_seconds: float) -> None:
+        self._limit = max(1, limit)
+        self._max_wait = max_wait_seconds
+        self._inflight: dict[int, int] = {}
+        self._waiters: dict[int, list[tuple[float, int, asyncio.Event]]] = {}
+        self._seq = 0
+        self.stat_paced_total = 0
+        self.stat_timeouts_total = 0
+        self.stat_wait_seconds_total = 0.0
+
+    async def acquire(self, worker_id: int, cost: float) -> None:
+        if self._inflight.get(worker_id, 0) < self._limit:
+            self._inflight[worker_id] = self._inflight.get(worker_id, 0) + 1
+            return
+        self._seq += 1
+        event = asyncio.Event()
+        entry = (cost, self._seq, event)
+        queue = self._waiters.setdefault(worker_id, [])
+        queue.append(entry)
+        queue.sort(key=lambda e: (e[0], e[1]))
+        self.stat_paced_total += 1
+        started = time.monotonic()
+        try:
+            await asyncio.wait_for(event.wait(), timeout=self._max_wait)
+        except asyncio.TimeoutError:
+            self.stat_timeouts_total += 1
+            if entry in queue:
+                queue.remove(entry)
+            self._inflight[worker_id] = self._inflight.get(worker_id, 0) + 1
+        finally:
+            self.stat_wait_seconds_total += time.monotonic() - started
+
+    def release(self, worker_id: int) -> None:
+        queue = self._waiters.get(worker_id)
+        if queue:
+            _cost, _seq, event = queue.pop(0)
+            # Slot transfers to the released waiter; inflight count unchanged.
+            event.set()
+            return
+        current = self._inflight.get(worker_id, 0)
+        if current > 0:
+            self._inflight[worker_id] = current - 1
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "paced_total": self.stat_paced_total,
+            "pacing_timeouts_total": self.stat_timeouts_total,
+            "pacing_wait_seconds_total": round(self.stat_wait_seconds_total, 3),
+        }
 
 
 class ThunderAgentScheduler:
@@ -87,6 +159,11 @@ class ThunderAgentScheduler:
         self._stat_warmups_failed = 0
         self._stat_warmups_skipped_util = 0
         self._warmup_fn: Optional[Callable[[str, int], Awaitable[bool]]] = None
+        self.pacer: Optional[PrefillPacer] = (
+            PrefillPacer(config.pacing_inflight_limit, config.pacing_max_wait_seconds)
+            if config.pacing_enabled
+            else None
+        )
 
     def set_warmup_callback(
         self, warmup_fn: Callable[[str, int], Awaitable[bool]]
@@ -177,6 +254,11 @@ class ThunderAgentScheduler:
                 was_paused=was_paused,
                 was_soft_demoted=soft_demoted,
                 assigned_worker_hint=program.assigned_worker_id,
+                pacing_cost=float(
+                    program.last_completion_tokens
+                    if program.step_count > 1
+                    else program.token_total
+                ),
             )
 
     def _admit_locked(
@@ -759,6 +841,7 @@ class ThunderAgentScheduler:
                     "warmups_fired_total": self._stat_warmups_fired,
                     "warmups_failed_total": self._stat_warmups_failed,
                     "warmups_skipped_util_total": self._stat_warmups_skipped_util,
+                    **(self.pacer.snapshot() if self.pacer is not None else {}),
                 },
                 "gauges": {
                     "programs_total": len(self._table.programs),
