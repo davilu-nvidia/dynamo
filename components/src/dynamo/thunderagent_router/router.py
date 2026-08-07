@@ -12,9 +12,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import statistics
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from dynamo.thunderagent_router.capacity import WorkerCapacityProvider
 from dynamo.thunderagent_router.program_state import (
@@ -35,6 +36,15 @@ class PauseDecision:
     was_paused: bool = False
     was_soft_demoted: bool = False
     assigned_worker_hint: Optional[int] = None
+    # Expected new prefill tokens for this step (pacer SJF cost): last step's
+    # completion tokens if known, else the full prompt (first step = cold).
+    pacing_cost: float = 0.0
+    # Cold first steps are exempt from pacing: a stampede of new programs is
+    # pure prefill work that batches efficiently -- serializing it only moves
+    # the queue into the router (observed: conc>=5 first-step p50 went 1.15s
+    # -> 2.30s when paced). Pacing targets returning steps, whose small
+    # divergence re-prefills genuinely collide.
+    pace_eligible: bool = False
 
 
 @dataclass
@@ -50,6 +60,85 @@ class ThunderAgentConfig:
     acting_token_weight: float = 1.0
     acting_decay_tau_seconds: float = 1.0
     buffer_per_program: int = 100
+    # Gap-harvest warmup: during a program's acting gap (tool execution), if
+    # the pinned worker has spare capacity and the program is predicted to
+    # return soon, re-warm its prefix with a max_tokens=1 prefill so the next
+    # turn hits cache instead of recomputing an evicted prefix. Off by
+    # default; utilization-gated so it never competes with pause/resume.
+    warmup_enabled: bool = False
+    warmup_util_threshold: float = 0.50
+    warmup_lead_seconds: float = 5.0
+    warmup_min_samples: int = 2
+    warmup_max_per_tick: int = 4
+    # Prefill admission pacing: bound the number of program prefills in
+    # flight per worker; excess admissions queue in the router ordered by
+    # expected new prefill tokens (shortest-job-first). Agent arrivals are
+    # naturally bursty (batch starts, similar-duration tool calls returning
+    # together); pacing converts a burst's batched prefill contention into a
+    # pipeline, cutting mean and tail TTFT. Off by default.
+    pacing_enabled: bool = False
+    pacing_inflight_limit: int = 2
+    pacing_max_wait_seconds: float = 2.0
+
+
+class PrefillPacer:
+    """Per-worker in-flight prefill limiter with shortest-job-first release.
+
+    ``acquire`` blocks while ``limit`` requests hold slots for the same
+    worker, releasing waiters in ascending expected-cost order. A bounded
+    wait keeps the pacer strictly best-effort: on timeout the request
+    proceeds anyway, so a stuck stream can never wedge admissions.
+    """
+
+    def __init__(self, limit: int, max_wait_seconds: float) -> None:
+        self._limit = max(1, limit)
+        self._max_wait = max_wait_seconds
+        self._inflight: dict[int, int] = {}
+        self._waiters: dict[int, list[tuple[float, int, asyncio.Event]]] = {}
+        self._seq = 0
+        self.stat_paced_total = 0
+        self.stat_timeouts_total = 0
+        self.stat_wait_seconds_total = 0.0
+
+    async def acquire(self, worker_id: int, cost: float) -> None:
+        if self._inflight.get(worker_id, 0) < self._limit:
+            self._inflight[worker_id] = self._inflight.get(worker_id, 0) + 1
+            return
+        self._seq += 1
+        event = asyncio.Event()
+        entry = (cost, self._seq, event)
+        queue = self._waiters.setdefault(worker_id, [])
+        queue.append(entry)
+        queue.sort(key=lambda e: (e[0], e[1]))
+        self.stat_paced_total += 1
+        started = time.monotonic()
+        try:
+            await asyncio.wait_for(event.wait(), timeout=self._max_wait)
+        except asyncio.TimeoutError:
+            self.stat_timeouts_total += 1
+            if entry in queue:
+                queue.remove(entry)
+            self._inflight[worker_id] = self._inflight.get(worker_id, 0) + 1
+        finally:
+            self.stat_wait_seconds_total += time.monotonic() - started
+
+    def release(self, worker_id: int) -> None:
+        queue = self._waiters.get(worker_id)
+        if queue:
+            _cost, _seq, event = queue.pop(0)
+            # Slot transfers to the released waiter; inflight count unchanged.
+            event.set()
+            return
+        current = self._inflight.get(worker_id, 0)
+        if current > 0:
+            self._inflight[worker_id] = current - 1
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "paced_total": self.stat_paced_total,
+            "pacing_timeouts_total": self.stat_timeouts_total,
+            "pacing_wait_seconds_total": round(self.stat_wait_seconds_total, 3),
+        }
 
 
 class ThunderAgentScheduler:
@@ -72,6 +161,26 @@ class ThunderAgentScheduler:
         self._stat_resumes = 0
         self._stat_marked_for_pause = 0
         self._stat_worker_assignments = 0
+        self._stat_warmups_fired = 0
+        self._stat_warmups_failed = 0
+        self._stat_warmups_skipped_util = 0
+        self._warmup_fn: Optional[Callable[[str, int], Awaitable[bool]]] = None
+        self.pacer: Optional[PrefillPacer] = (
+            PrefillPacer(config.pacing_inflight_limit, config.pacing_max_wait_seconds)
+            if config.pacing_enabled
+            else None
+        )
+
+    def set_warmup_callback(
+        self, warmup_fn: Callable[[str, int], Awaitable[bool]]
+    ) -> None:
+        """Register the coroutine that executes a warmup prefill.
+
+        Called as ``warmup_fn(program_id, worker_id)``; returns True on
+        success. The scheduler only decides *when* to warm; the handler owns
+        the cached prefix and the engine client.
+        """
+        self._warmup_fn = warmup_fn
 
     def start(self) -> None:
         if self._scheduler_task is not None:
@@ -151,6 +260,12 @@ class ThunderAgentScheduler:
                 was_paused=was_paused,
                 was_soft_demoted=soft_demoted,
                 assigned_worker_hint=program.assigned_worker_id,
+                pacing_cost=float(
+                    program.last_completion_tokens
+                    if program.step_count > 1
+                    else program.token_total
+                ),
+                pace_eligible=program.step_count > 1,
             )
 
     def _admit_locked(
@@ -270,6 +385,78 @@ class ThunderAgentScheduler:
         self._apply_soft_demotes(capacities)
         await self._greedy_resume(capacities)
         await self._pause_until_safe(capacities)
+        await self._maybe_warmup(capacities)
+
+    async def _maybe_warmup(self, capacities: dict[int, int]) -> None:
+        """Fire prefix warmups for acting programs predicted to return soon.
+
+        A program qualifies when all of the following hold:
+        - it is ACTIVE + ACTING with a pinned worker present in ``capacities``,
+        - it has at least ``warmup_min_samples`` observed acting gaps,
+        - elapsed gap time >= median(gap samples) - ``warmup_lead_seconds``,
+        - pinned worker utilization < ``warmup_util_threshold``, and
+        - no warmup was fired for the current step yet.
+
+        The utilization gate makes this strictly slack-harvesting: under
+        pressure the gate closes and pause/resume remains the only mechanism.
+        """
+        if not self._cfg.warmup_enabled or self._warmup_fn is None:
+            return
+        now = time.monotonic()
+        picked: list[tuple[str, int, float, float]] = []
+        async with self._lock:
+            for program in self._table.programs.values():
+                if len(picked) >= self._cfg.warmup_max_per_tick:
+                    break
+                worker_id = program.assigned_worker_id
+                if (
+                    program.lifecycle != ProgramLifecycle.ACTIVE
+                    or program.status != ProgramStatus.ACTING
+                    or worker_id is None
+                    or worker_id not in capacities
+                    or program.acting_since <= 0
+                    or program.warmup_step == program.step_count
+                    or len(program.gap_samples) < self._cfg.warmup_min_samples
+                ):
+                    continue
+                predicted = statistics.median(program.gap_samples)
+                elapsed = now - program.acting_since
+                if elapsed < max(0.0, predicted - self._cfg.warmup_lead_seconds):
+                    continue
+                capacity = capacities[worker_id]
+                util = self._worker_used(worker_id) / capacity if capacity else 1.0
+                if util >= self._cfg.warmup_util_threshold:
+                    self._stat_warmups_skipped_util += 1
+                    continue
+                program.warmup_step = program.step_count
+                picked.append((program.program_id, worker_id, elapsed, predicted))
+
+        for program_id, worker_id, elapsed, predicted in picked:
+            self._stat_warmups_fired += 1
+            logger.info(
+                "thunderagent.warmup fire program=%s worker=%s "
+                "elapsed=%.1fs predicted_gap=%.1fs",
+                program_id,
+                worker_id,
+                elapsed,
+                predicted,
+            )
+            asyncio.create_task(self._run_warmup(program_id, worker_id))
+
+    async def _run_warmup(self, program_id: str, worker_id: int) -> None:
+        assert self._warmup_fn is not None
+        try:
+            ok = await self._warmup_fn(program_id, worker_id)
+        except Exception:
+            ok = False
+            logger.warning(
+                "thunderagent.warmup error program=%s worker=%s",
+                program_id,
+                worker_id,
+                exc_info=True,
+            )
+        if not ok:
+            self._stat_warmups_failed += 1
 
     def _program_tokens(self, program: Program, *, decayed: bool = False) -> int:
         if program.status != ProgramStatus.ACTING:
@@ -658,6 +845,10 @@ class ThunderAgentScheduler:
                     "programs_marked_for_pause_total": self._stat_marked_for_pause,
                     "forced_resumes_total": self._stat_forced_resumes,
                     "worker_assignments_total": self._stat_worker_assignments,
+                    "warmups_fired_total": self._stat_warmups_fired,
+                    "warmups_failed_total": self._stat_warmups_failed,
+                    "warmups_skipped_util_total": self._stat_warmups_skipped_util,
+                    **(self.pacer.snapshot() if self.pacer is not None else {}),
                 },
                 "gauges": {
                     "programs_total": len(self._table.programs),

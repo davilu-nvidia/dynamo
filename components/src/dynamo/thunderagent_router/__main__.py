@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from collections import OrderedDict
 from typing import Any, Optional
 
 import uvloop
@@ -42,6 +44,13 @@ from dynamo.thunderagent_router.router import ThunderAgentScheduler
 
 configure_dynamo_logging()
 logger = logging.getLogger(__name__)
+
+# Gap-harvest warmup: bound the per-router prefix cache and the size of a
+# single warmup prefill. Prefixes above the cap are skipped, not truncated --
+# a truncated warmup would still help, but keeping the first version simple.
+WARMUP_CACHE_MAX_PROGRAMS = 512
+WARMUP_MAX_PREFIX_TOKENS = 131072
+WARMUP_MAX_OUTPUT_TOKENS = 16384
 
 
 def _extract_program_id(request: dict[str, Any]) -> Optional[str]:
@@ -137,6 +146,9 @@ class ThunderAgentRouterHandler:
         self._stat_program_requests = 0
         self._stat_passthrough_requests = 0
         self._stat_session_final_requests = 0
+        # program_id -> {model, prompt_ids, output_ids, sampling_options,
+        # output_options, eos_token_ids}; LRU-bounded, pruned on session_final.
+        self._warmup_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
 
     async def initialize(self) -> None:
         # Endpoint shape was validated by ThunderAgentRouterConfig.validate()
@@ -158,6 +170,7 @@ class ThunderAgentRouterHandler:
             config=self._config.to_thunderagent_config(),
         )
         self._scheduler.start()
+        self._scheduler.set_warmup_callback(self._fire_warmup)
         logger.info(
             "ThunderAgent Router initialized (worker_endpoint=%s, block_size=%s)",
             self._config.endpoint,
@@ -185,6 +198,7 @@ class ThunderAgentRouterHandler:
         if program_id is not None and _is_session_final(request):
             self._stat_session_final_requests += 1
             released = await self._scheduler.end_program(program_id)
+            self._warmup_cache.pop(program_id, None)
             logger.info(
                 "thunderagent.route path=session_final program=%s released=%s",
                 program_id,
@@ -247,6 +261,7 @@ class ThunderAgentRouterHandler:
         )
 
         preprocessed = _wrap_preprocessed_request(request)
+        self._remember_warmup_prefix(program_id, preprocessed)
         if decision.priority_jump != 0.0:
             routing = preprocessed.get("routing") or {}
             existing = routing.get("priority_jump") or 0.0
@@ -257,6 +272,12 @@ class ThunderAgentRouterHandler:
             routing = preprocessed.get("routing") or {}
             routing["backend_instance_id"] = worker_pin
             preprocessed["routing"] = routing
+
+        pacer = self._scheduler.pacer
+        pacer_slot: Optional[int] = None
+        if pacer is not None and worker_pin is not None and decision.pace_eligible:
+            await pacer.acquire(worker_pin, decision.pacing_cost)
+            pacer_slot = worker_pin
 
         prompt_tokens_seen = 0
         completion_tokens_seen = 0
@@ -282,6 +303,10 @@ class ThunderAgentRouterHandler:
             async for chunk in await self._kv_router.generate_from_request(
                 preprocessed  # type: ignore[arg-type]
             ):
+                if pacer_slot is not None:
+                    # First token is out: prefill finished, hand the slot on.
+                    pacer.release(pacer_slot)
+                    pacer_slot = None
                 if first_chunk and worker_pin is None:
                     first_chunk = False
                     selected_worker = self._extract_worker_id(chunk)
@@ -316,11 +341,19 @@ class ThunderAgentRouterHandler:
                     if not usage_completion_seen:
                         completion_tokens_seen += len(token_ids_out)
                     self._scheduler.record_output_tokens(program_id, len(token_ids_out))
+                    entry = self._warmup_cache.get(program_id)
+                    if (
+                        entry is not None
+                        and len(entry["output_ids"]) < WARMUP_MAX_OUTPUT_TOKENS
+                    ):
+                        entry["output_ids"].extend(token_ids_out)
 
                 if proof is not None:
                     _inject_thunderagent_route_proof(chunk, proof)
                 yield chunk
         finally:
+            if pacer_slot is not None:
+                pacer.release(pacer_slot)
             # Fall back to len(token_ids) if the engine didn't report usage --
             # still better than upstream's chars/5 estimator.
             if prompt_tokens_seen == 0 and isinstance(token_ids, list):
@@ -380,6 +413,81 @@ class ThunderAgentRouterHandler:
             "gauges": scheduler_metrics["gauges"],
             "workers": scheduler_metrics["workers"],
         }
+
+    def _remember_warmup_prefix(
+        self, program_id: str, preprocessed: dict[str, Any]
+    ) -> None:
+        """Snapshot the fields needed to rebuild this turn's prefix later.
+
+        Called before routing overrides are applied, so the cached request
+        template is pin-free; ``_fire_warmup`` adds its own worker pin.
+        """
+        token_ids = preprocessed.get("token_ids")
+        if not isinstance(token_ids, list) or not token_ids:
+            return
+        self._warmup_cache[program_id] = {
+            "model": preprocessed.get("model", "unknown"),
+            "prompt_ids": list(token_ids),
+            "output_ids": [],
+            "sampling_options": preprocessed.get("sampling_options", {}),
+            "output_options": preprocessed.get("output_options", {}),
+            "eos_token_ids": preprocessed.get("eos_token_ids", []),
+        }
+        self._warmup_cache.move_to_end(program_id)
+        while len(self._warmup_cache) > WARMUP_CACHE_MAX_PROGRAMS:
+            self._warmup_cache.popitem(last=False)
+
+    async def _fire_warmup(self, program_id: str, worker_id: int) -> bool:
+        """Re-warm a program's prefix on its pinned worker (max_tokens=1).
+
+        The prefix is the last prompt plus the response generated for it --
+        the longest prefix of the next turn we can know without re-rendering
+        the chat template. Radix matching stops wherever the next turn
+        actually diverges (e.g. stripped thinking content), so an over-long
+        prefix costs one token of decode, never correctness.
+
+        Deliberately bypasses before/after_request: warmups must not count
+        as program steps or token usage.
+        """
+        if self._kv_router is None:
+            return False
+        entry = self._warmup_cache.get(program_id)
+        if entry is None:
+            return False
+        prefix = entry["prompt_ids"] + entry["output_ids"]
+        if not prefix or len(prefix) > WARMUP_MAX_PREFIX_TOKENS:
+            return False
+        warmup_request = {
+            "model": entry["model"],
+            "token_ids": prefix,
+            "stop_conditions": {"max_tokens": 1},
+            "sampling_options": entry["sampling_options"],
+            "output_options": entry["output_options"],
+            "eos_token_ids": entry["eos_token_ids"],
+            "annotations": [],
+            "routing": {"backend_instance_id": worker_id},
+            "router_config_override": None,
+            "prefill_result": None,
+            "bootstrap_info": None,
+            "extra_args": None,
+            "mm_processor_kwargs": None,
+            "agent_context": None,
+            "request_timestamp_ms": None,
+        }
+        started = time.monotonic()
+        async for _chunk in await self._kv_router.generate_from_request(
+            warmup_request  # type: ignore[arg-type]
+        ):
+            pass
+        logger.info(
+            "thunderagent.warmup done program=%s worker=%s "
+            "prefix_tokens=%d took=%.2fs",
+            program_id,
+            worker_id,
+            len(prefix),
+            time.monotonic() - started,
+        )
+        return True
 
     def _extract_worker_id(self, chunk: Any) -> Optional[int]:
         # Expects the shape set by ``inject_worker_id_from_tracker`` in the Python
