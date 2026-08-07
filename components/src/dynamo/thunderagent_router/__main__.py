@@ -275,7 +275,7 @@ class ThunderAgentRouterHandler:
 
         pacer = self._scheduler.pacer
         pacer_slot: Optional[int] = None
-        if pacer is not None and worker_pin is not None:
+        if pacer is not None and worker_pin is not None and decision.pace_eligible:
             await pacer.acquire(worker_pin, decision.pacing_cost)
             pacer_slot = worker_pin
 

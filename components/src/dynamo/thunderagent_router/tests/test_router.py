@@ -569,3 +569,13 @@ async def test_pacing_cost_uses_last_completion_then_prompt():
     await router.after_request("p1", prompt_tokens=1200, completion_tokens=333)
     d2 = await router.before_request("p1", estimated_prompt_tokens=1600)
     assert d2.pacing_cost == 333  # later steps: last completion (divergence)
+
+
+@pytest.mark.asyncio
+async def test_first_step_exempt_from_pacing():
+    router, _ = make_router(capacity_workers={1: 10_000})
+    d1 = await router.before_request("p1", estimated_prompt_tokens=1200)
+    assert d1.pace_eligible is False  # cold first step: never paced
+    await router.after_request("p1", prompt_tokens=1200, completion_tokens=50)
+    d2 = await router.before_request("p1", estimated_prompt_tokens=1300)
+    assert d2.pace_eligible is True

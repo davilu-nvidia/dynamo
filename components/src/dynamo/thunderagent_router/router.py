@@ -39,6 +39,12 @@ class PauseDecision:
     # Expected new prefill tokens for this step (pacer SJF cost): last step's
     # completion tokens if known, else the full prompt (first step = cold).
     pacing_cost: float = 0.0
+    # Cold first steps are exempt from pacing: a stampede of new programs is
+    # pure prefill work that batches efficiently -- serializing it only moves
+    # the queue into the router (observed: conc>=5 first-step p50 went 1.15s
+    # -> 2.30s when paced). Pacing targets returning steps, whose small
+    # divergence re-prefills genuinely collide.
+    pace_eligible: bool = False
 
 
 @dataclass
@@ -259,6 +265,7 @@ class ThunderAgentScheduler:
                     if program.step_count > 1
                     else program.token_total
                 ),
+                pace_eligible=program.step_count > 1,
             )
 
     def _admit_locked(
